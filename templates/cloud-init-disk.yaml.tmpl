@@ -1,0 +1,14 @@
+# đoạn này KHÔNG có #cloud-config
+fs_setup:
+  - label: ${data_label}
+    filesystem: ${data_fs}
+    device: ${data_disk_device}
+    overwrite: false
+
+mounts:
+  - [ ${data_disk_device}, ${data_mountpoint}, ${data_fs}, "defaults,nofail", "0", "2" ]
+
+runcmd:
+  - [ mkdir, -p, ${data_mountpoint} ]
+  - [ chown, -R, ubuntu:ubuntu, ${data_mountpoint} ]
+  - [ mount, -a ]

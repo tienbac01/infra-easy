@@ -1,0 +1,12 @@
+version: 2
+ethernets:
+  ${iface}:
+    dhcp4: false
+    addresses:
+      - ${ip_addr}/${prefix}
+    gateway4: ${gateway}
+    nameservers:
+      addresses:
+%{ for d in dns_list ~}
+        - ${d}
+%{ endfor ~}
