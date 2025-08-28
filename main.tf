@@ -25,7 +25,7 @@ resource "libvirt_network" "net" {
 }
 
 # 2) Clone OS disk từ base image cho từng VM
-resource "libvirt_volume" "disk" {
+resource "libvirt_volume" "os" {
   for_each = local.indices
 
   name   = "${var.vm_prefix}-${each.key}.qcow2"
@@ -41,7 +41,11 @@ resource "libvirt_volume" "data" {
   name   = "${var.vm_prefix}-${each.key}-data.qcow2"
   pool   = var.pool
   size   = local.data_disk_size
-  format = "qcow2"  # thin provisioning
+  format = "qcow2"
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # 3) Cloud-init ISO (user-data + network-config) cho từng VM
@@ -81,13 +85,12 @@ resource "libvirt_domain" "vm" {
 
   # OS disk
   disk {
-    volume_id = libvirt_volume.disk[each.key].id
+    volume_id = libvirt_volume.os[each.key].id
   }
 
   # Data disk 300GB
   disk {
     volume_id = libvirt_volume.data[each.key].id
-    # target  = "vdb"   # có thể cố định nếu bạn muốn khớp cloud-init
   }
 
   cloudinit = libvirt_cloudinit_disk.cidata[each.key].id
@@ -100,4 +103,8 @@ resource "libvirt_domain" "vm" {
 
   autostart  = true
   depends_on = [libvirt_network.net]
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }

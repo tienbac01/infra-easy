@@ -38,7 +38,7 @@ variable "base_image_path" {
   default     = "/mnt/data/terraform/images/ubuntu-24.04-server-cloudimg-amd64.img"
 }
 
-variable "disk_size_gb" {
+variable "os_disk_size_gb" {
   type        = number
   description = "Dung lượng disk mỗi VM (GB)"
   default     = 20

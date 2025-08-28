@@ -4,7 +4,7 @@ pool            = "terraform"
 base_image_path = "/mnt/data/terraform/images/ubuntu-24.04-server-cloudimg-amd64.img"
 
 network_name = "tf-net"
-subnet_cidr  = "192.168.56.0/24"
+subnet_cidr  = "192.168.56.0/24"  
 ip_start     = 10
 gateway_ip   = "192.168.56.1"
 
