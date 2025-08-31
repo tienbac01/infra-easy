@@ -43,9 +43,9 @@ resource "libvirt_volume" "data" {
   size   = local.data_disk_size
   format = "qcow2"
 
-  lifecycle {
-    prevent_destroy = true
-  }
+  # lifecycle {
+  #   prevent_destroy = true
+  # }
 }
 
 # 3) Cloud-init ISO (user-data + network-config) cho từng VM
@@ -104,7 +104,7 @@ resource "libvirt_domain" "vm" {
   autostart  = true
   depends_on = [libvirt_network.net]
 
-  lifecycle {
-    prevent_destroy = true
-  }
+  # lifecycle {
+  #   prevent_destroy = true
+  # }
 }
