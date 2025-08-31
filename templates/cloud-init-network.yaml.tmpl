@@ -1,10 +1,14 @@
 version: 2
 ethernets:
-  ${iface}:
+  nic0:
+    match:
+      macaddress: '${mac}'
     dhcp4: false
     addresses:
       - ${ip_addr}/${prefix}
-    gateway4: ${gateway}
+    routes:
+      - to: default
+        via: ${gateway}
     nameservers:
       addresses:
 %{ for d in dns_list ~}

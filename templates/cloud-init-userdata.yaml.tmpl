@@ -1,15 +1,21 @@
 #cloud-config
 hostname: ${hostname}
 manage_etc_hosts: true
+ssh_pwauth: true
 users:
   - default
   - name: ubuntu
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
     ssh_authorized_keys:
 %{ for k in ssh_keys ~}
       - ${k}
 %{ endfor ~}
 
+chpasswd:
+  list: |
+    ubuntu:${ubuntu_password}
+  expire: false
 
 ${disk_block}

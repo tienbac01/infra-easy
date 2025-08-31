@@ -1,0 +1,132 @@
+---
+- name: Node baseline checks
+  hosts: all
+  become: true
+  gather_facts: yes
+  vars:
+    min_root_free_gb: 4
+  tasks:
+    - name: Ping nodes
+      ping:
+
+    - name: Find root mount facts
+      set_fact:
+        root_mount: "{{ (ansible_mounts | selectattr('mount','equalto','/') | list | first) | default({}) }}"
+
+    - name: Assert root free space >= {{ min_root_free_gb }}GB
+      assert:
+        that:
+          - root_mount.size_available is defined
+          - (root_mount.size_available | int) >= (min_root_free_gb * 1024 * 1024 * 1024)
+        fail_msg: "Root FS free space too low: {{ (root_mount.size_available | int) // (1024*1024*1024) }}GB < {{ min_root_free_gb }}GB"
+        success_msg: "Root FS free space OK: {{ (root_mount.size_available | int) // (1024*1024*1024) }}GB"
+
+    - name: kubelet is active
+      command: systemctl is-active kubelet
+      register: kubelet_active
+      changed_when: false
+      failed_when: kubelet_active.rc != 0 or kubelet_active.stdout.strip() != 'active'
+
+    - name: containerd is active
+      command: systemctl is-active containerd
+      register: containerd_active
+      changed_when: false
+      failed_when: containerd_active.rc != 0 or containerd_active.stdout.strip() != 'active'
+
+    - name: containerd uses systemd cgroups
+      command: bash -lc "grep -q '^\s*SystemdCgroup = true' /etc/containerd/config.toml"
+      register: cgroup_check
+      changed_when: false
+
+- name: Control-plane cluster checks
+  hosts: kube_control_plane[0]
+  become: true
+  gather_facts: no
+  vars:
+    kubeconfig: /home/ubuntu/.kube/config
+  tasks:
+    - name: kubectl get nodes (json)
+      command: kubectl get nodes -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: nodes_json
+      changed_when: false
+
+    - name: Parse nodes json
+      set_fact:
+        nodes: "{{ nodes_json.stdout | from_json }}"
+
+    - name: Assert all nodes Ready
+      vars:
+        not_ready: "{{ nodes.items | map(attribute='status')
+                        | map(attribute='conditions')
+                        | list }}"
+      assert:
+        that:
+          - (
+              nodes.items | selectattr(
+                'status.conditions',
+                'defined'
+              ) | select(
+                'equalto',
+                none
+              ) | list | length
+            ) == 0
+        fail_msg: "Some nodes missing conditions"
+      when: nodes.items | length > 0
+
+    - name: Build list of not-ready nodes
+      set_fact:
+        nodes_not_ready: "{{ nodes.items | map('extract', attribute='status') | list | map('extract', attribute='conditions') | list }}"
+      when: false  # placeholder for readability
+
+    - name: Assert Ready condition true for all nodes
+      assert:
+        that:
+          - (
+              nodes.items | selectattr('status.conditions','defined')
+                | rejectattr('status.conditions','equalto', none)
+                | map(attribute='status.conditions')
+                | map('selectattr','type','equalto','Ready')
+                | map('selectattr','status','equalto','True')
+                | map('list')
+                | map('length')
+                | sum
+            ) == (nodes.items | length)
+        fail_msg: "At least one node is not Ready: {{ nodes.items | rejectattr('status.conditions','defined') | map(attribute='metadata.name') | list }}"
+
+    - name: coredns deployment status
+      command: kubectl -n kube-system get deploy coredns -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: coredns_json
+      changed_when: false
+
+    - name: Assert coredns availableReplicas == replicas
+      set_fact:
+        coredns: "{{ coredns_json.stdout | from_json }}"
+
+    - name: Check coredns
+      assert:
+        that:
+          - (coredns.status.availableReplicas | default(0)) >= 1
+          - (coredns.status.availableReplicas | default(0)) == (coredns.spec.replicas | default(1))
+        fail_msg: "coredns not fully available: {{ coredns.status | default({}) }}"
+
+    - name: kube-proxy daemonset status
+      command: kubectl -n kube-system get ds kube-proxy -o json
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: kproxy_json
+      changed_when: false
+
+    - name: Check kube-proxy
+      set_fact:
+        kproxy: "{{ kproxy_json.stdout | from_json }}"
+
+    - name: Assert kube-proxy ready == desired
+      assert:
+        that:
+          - (kproxy.status.numberReady | default(0)) == (kproxy.status.desiredNumberScheduled | default(0))
+        fail_msg: "kube-proxy not ready on all nodes: {{ kproxy.status | default({}) }}"
+

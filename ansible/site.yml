@@ -1,0 +1,59 @@
+---
+- name: Acquire run lock (optional)
+  hosts: kube_control_plane[0]
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  run_once: true
+  pre_tasks:
+    - name: Ensure lock dir exists
+      file:
+        path: "{{ ansible_run_lock_path | dirname }}"
+        state: directory
+        mode: '0755'
+      when: enable_run_lock | default(true)
+
+    - name: Acquire lock using flock
+      shell: |
+        flock -n {{ ansible_run_lock_path }} -c 'echo acquired'
+      changed_when: false
+      when: enable_run_lock | default(true)
+
+- name: Prepare nodes
+  hosts: all
+  become: true
+  tags: [bootstrap]
+  roles:
+    - role: common
+    - role: containerd
+    - role: kubernetes
+
+- name: Initialize first control-plane
+  hosts: kube_control_plane[0]
+  become: true
+  tags: [init]
+  roles:
+    - role: control_plane_init
+
+- name: Install Kubernetes Dashboard (UI)
+  hosts: kube_control_plane[0]
+  become: true
+  tags: [dashboard]
+  roles:
+    - role: k8s_dashboard
+
+- name: Join remaining control-planes
+  hosts: kube_control_plane[1:]
+  become: true
+  serial: 1
+  tags: [join_cp]
+  roles:
+    - role: join_control_plane
+
+- name: Join workers
+  hosts: kube_node
+  become: true
+  serial: 2
+  tags: [join_worker]
+  roles:
+    - role: join_worker

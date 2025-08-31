@@ -107,3 +107,19 @@ variable "data_label" {
   description = "Nhãn filesystem"
   default     = "data"
 }
+
+variable "control_plane_count" {
+  type        = number
+  description = "Số node control-plane đầu tiên trong cụm (>=1, <= vm_count)"
+  default     = 1
+  validation {
+    condition     = var.control_plane_count >= 1 && var.control_plane_count <= var.vm_count
+    error_message = "control_plane_count phải trong [1, vm_count]."
+  }
+}
+
+variable "ubuntu_password" {
+  type        = string
+  description = "Mật khẩu cho user ubuntu (cloud-init)"
+  sensitive   = true
+}

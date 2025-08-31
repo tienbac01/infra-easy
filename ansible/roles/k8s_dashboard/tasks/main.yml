@@ -1,0 +1,101 @@
+---
+- name: Set kubeconfig path
+  set_fact:
+    kubeconfig: /home/ubuntu/.kube/config
+
+- name: Ensure dashboard namespace exists (idempotent)
+  command: kubectl get ns kubernetes-dashboard
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: dash_ns
+  changed_when: false
+  failed_when: dash_ns.rc not in [0,1]
+
+- name: Install/refresh Kubernetes Dashboard (recommended manifest)
+  shell: |
+    kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.7.0/aio/deploy/recommended.yaml
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  changed_when: false
+
+- name: Mark Dashboard installed
+  file:
+    path: /root/dashboard.installed
+    state: touch
+
+- name: Create admin user ServiceAccount
+  copy:
+    dest: /root/k8s-admin-user.yaml
+    content: |
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: admin-user
+        namespace: kubernetes-dashboard
+      ---
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: admin-user-binding
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: cluster-admin
+      subjects:
+      - kind: ServiceAccount
+        name: admin-user
+        namespace: kubernetes-dashboard
+
+- name: Apply admin user RBAC
+  command: kubectl apply -f /root/k8s-admin-user.yaml
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  changed_when: false
+
+- name: Create NodePort Service for Dashboard
+  copy:
+    dest: /root/k8s-dashboard-nodeport.yaml
+    content: |
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: kubernetes-dashboard-nodeport
+        namespace: kubernetes-dashboard
+        labels:
+          k8s-app: kubernetes-dashboard
+      spec:
+        type: NodePort
+        selector:
+          k8s-app: kubernetes-dashboard
+        ports:
+        - port: 443
+          targetPort: 8443
+          protocol: TCP
+          nodePort: 30080
+
+- name: Apply NodePort Service
+  command: kubectl apply -f /root/k8s-dashboard-nodeport.yaml
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  changed_when: false
+
+- name: Generate admin-user token
+  command: kubectl -n kubernetes-dashboard create token admin-user
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  register: dashboard_token
+  changed_when: false
+
+- name: Save token to file for ubuntu user
+  copy:
+    dest: /home/ubuntu/dashboard-token.txt
+    content: "{{ dashboard_token.stdout | trim }}\n"
+    owner: ubuntu
+    group: ubuntu
+    mode: '0600'
+
+- name: Show Dashboard URL and token
+  debug:
+    msg:
+      - "Dashboard URL: https://<any-node-ip>:30080/"
+      - "Login with token saved at /home/ubuntu/dashboard-token.txt"

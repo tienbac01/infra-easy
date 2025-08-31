@@ -10,6 +10,8 @@ growpart:
   devices: ["/"]
   ignore_growroot_disabled: false
 
+resize_rootfs: true
+
 mounts:
   - [ ${data_disk_device}, ${data_mountpoint}, ${data_fs}, "defaults,nofail", "0", "2" ]
 
@@ -17,5 +19,3 @@ runcmd:
   - [ mkdir, -p, ${data_mountpoint} ]
   - [ chown, -R, ubuntu:ubuntu, ${data_mountpoint} ]
   - [ mount, -a ]
-  - [ bash, -c, "growpart /dev/vda 1" ]
-  - [ bash, -c, "resize2fs /dev/vda1" ]

@@ -1,0 +1,6 @@
+---
+- name: Join worker
+  shell: "{{ hostvars['localhost']['worker_join_cmd'] }}"
+  args:
+    creates: /etc/kubernetes/kubelet.conf
+

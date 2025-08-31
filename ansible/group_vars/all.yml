@@ -1,0 +1,7 @@
+---
+# Global knobs for safe re-runs
+enable_run_lock: true
+ansible_run_lock_path: /var/lock/ansible-k8s.lock
+run_lock_owner: root
+run_lock_mode: '0644'
+
