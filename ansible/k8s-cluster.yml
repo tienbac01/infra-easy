@@ -1,3 +1,0 @@
----
-# Wrapper to keep compatibility: include the structured site playbook
-- import_playbook: site.yml

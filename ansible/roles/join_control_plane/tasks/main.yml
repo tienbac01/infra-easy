@@ -1,6 +1,0 @@
----
-- name: Join control-plane
-  shell: "{{ hostvars['localhost']['cp_join_cmd'] }}"
-  args:
-    creates: /etc/kubernetes/kubelet.conf
-
