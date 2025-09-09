@@ -1,0 +1,23 @@
+# Terraform state files
+*.tfstate
+*.tfstate.*
+crash.log
+
+# Terraform variables
+*.tfvars
+
+# Terraform plan files
+*.tfplan
+
+# .terraform directory
+.terraform/
+
+# Cloud-init ISO files (nếu sinh ra trong pool)
+*.iso
+
+# Editor/OS files
+*.swp
+*.swo
+*.bak
+*~
+.DS_Store

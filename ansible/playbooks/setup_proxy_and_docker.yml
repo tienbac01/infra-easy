@@ -1,0 +1,229 @@
+---
+- name: Setup proxy, squid cert, and Docker (Ubuntu)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # Proxy configuration
+    proxy_url: "https://192.168.5.8:3128"
+    no_proxy: "127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.svc,.cluster.local"
+
+    # Squid cert installer script
+    install_script_url: "https://192.168.5.8:3128/install.sh"
+    install_script_path: "/usr/local/sbin/proxy-cert-install.sh"
+
+    # Docker APT repo
+    docker_repo_url: "https://download.docker.com/linux/ubuntu"
+
+    # Map Ansible arch to dpkg arch for Docker repo
+    dpkg_arch_map:
+      x86_64: amd64
+      aarch64: arm64
+      armv7l: armhf
+      ppc64le: ppc64el
+      s390x: s390x
+    dpkg_arch: "{{ dpkg_arch_map.get(ansible_architecture, ansible_architecture) }}"
+
+    # Offline images
+    offline_image_dir: "/mnt/data"
+    offline_image_patterns:
+      - "*.tar"
+      - "*.tar.gz"
+
+  pre_tasks:
+    - name: Ensure target is Ubuntu
+      assert:
+        that: ansible_distribution | lower == 'ubuntu'
+        fail_msg: "This playbook supports Ubuntu only. Found {{ ansible_distribution }}."
+        success_msg: "Ubuntu detected: {{ ansible_distribution_release }}"
+
+  tasks:
+    - block:
+        - name: Configure APT to use proxy
+          copy:
+            dest: /etc/apt/apt.conf.d/95proxies
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              Acquire::http::Proxy "{{ proxy_url }}";
+              Acquire::https::Proxy "{{ proxy_url }}";
+
+        - name: Ensure /etc/environment has proxy variables (lowercase)
+          lineinfile:
+            path: /etc/environment
+            regexp: '^{{ item.key }}='
+            line: '{{ item.key }}="{{ item.value }}"'
+            create: true
+            owner: root
+            group: root
+            mode: '0644'
+          loop:
+            - { key: 'http_proxy',  value: '{{ proxy_url }}' }
+            - { key: 'https_proxy', value: '{{ proxy_url }}' }
+            - { key: 'no_proxy',    value: '{{ no_proxy }}' }
+
+        - name: Ensure /etc/environment has proxy variables (uppercase)
+          lineinfile:
+            path: /etc/environment
+            regexp: '^{{ item.key }}='
+            line: '{{ item.key }}="{{ item.value }}"'
+          loop:
+            - { key: 'HTTP_PROXY',  value: '{{ proxy_url }}' }
+            - { key: 'HTTPS_PROXY', value: '{{ proxy_url }}' }
+            - { key: 'NO_PROXY',    value: '{{ no_proxy }}' }
+      tags: [ 'proxy' ]
+
+    - block:
+        - name: Download squid cert install script (ignore TLS validation)
+          get_url:
+            url: "{{ install_script_url }}"
+            dest: "{{ install_script_path }}"
+            mode: '0755'
+            validate_certs: false
+          environment:
+            http_proxy: "{{ proxy_url }}"
+            https_proxy: "{{ proxy_url }}"
+
+        - name: Run cert installer script (add_cert)
+          command: "{{ install_script_path }} add_cert"
+          register: cert_install
+          changed_when: false
+      tags: [ 'cert' ]
+
+    - block:
+        - name: Remove old Docker packages (if any)
+          apt:
+            name:
+              - docker
+              - docker-engine
+              - docker.io
+              - containerd
+              - runc
+            state: absent
+            purge: yes
+
+        - name: Ensure required packages are installed
+          apt:
+            name:
+              - ca-certificates
+              - curl
+              - gnupg
+              - gzip
+            state: present
+            update_cache: yes
+
+        - name: Ensure keyring directory exists
+          file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: '0755'
+
+        - name: Download Docker GPG key
+          get_url:
+            url: "{{ docker_repo_url }}/gpg"
+            dest: /etc/apt/keyrings/docker.asc
+            mode: '0644'
+          environment:
+            http_proxy: "{{ proxy_url }}"
+            https_proxy: "{{ proxy_url }}"
+
+        - name: Dearmor Docker GPG key
+          command: >-
+            bash -c 'gpg --dearmor < /etc/apt/keyrings/docker.asc > /etc/apt/keyrings/docker.gpg'
+          args:
+            creates: /etc/apt/keyrings/docker.gpg
+
+        - name: Ensure Docker GPG key permissions
+          file:
+            path: /etc/apt/keyrings/docker.gpg
+            mode: '0644'
+            state: file
+
+        - name: Add Docker APT repository
+          copy:
+            dest: /etc/apt/sources.list.d/docker.list
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              deb [arch={{ dpkg_arch }} signed-by=/etc/apt/keyrings/docker.gpg] {{ docker_repo_url }} {{ ansible_distribution_release }} stable
+
+        - name: Update apt cache
+          apt:
+            update_cache: yes
+
+        - name: Install Docker packages
+          apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: present
+
+        - name: Configure Docker service proxy
+          copy:
+            dest: /etc/systemd/system/docker.service.d/http-proxy.conf
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              [Service]
+              Environment="HTTP_PROXY={{ proxy_url }}" "HTTPS_PROXY={{ proxy_url }}" "NO_PROXY={{ no_proxy }}"
+          notify:
+            - systemd daemon-reload
+            - restart docker
+
+        - name: Enable and start Docker
+          service:
+            name: docker
+            state: started
+            enabled: yes
+      tags: [ 'docker' ]
+
+    - block:
+        - name: Check Docker availability
+          command: docker version --format '{{"{{"}}.Server.Version{{"}}"}}'
+          register: docker_version
+          changed_when: false
+
+        - name: Find offline image archives
+          find:
+            paths: "{{ offline_image_dir }}"
+            patterns: "{{ offline_image_patterns }}"
+            recurse: yes
+            file_type: file
+          register: image_files
+
+        - name: Fail if no image archives found
+          fail:
+            msg: "No image archives found in {{ offline_image_dir }} (looked for {{ offline_image_patterns | join(', ') }})"
+          when: (image_files.matched | default(0) | int) == 0
+
+        - name: Load Docker images from archives
+          shell: |
+            set -o pipefail
+            f="{{ item.path }}"
+            if [[ "$f" == *.gz ]]; then
+              gzip -dc "$f" | docker load
+            else
+              docker load -i "$f"
+            fi
+          args:
+            executable: /bin/bash
+          loop: "{{ image_files.files | sort(attribute='path') }}"
+          loop_control:
+            label: "{{ item.path }}"
+      tags: [ 'images' ]
+
+  handlers:
+    - name: systemd daemon-reload
+      command: systemctl daemon-reload
+
+    - name: restart docker
+      service:
+        name: docker
+        state: restarted
