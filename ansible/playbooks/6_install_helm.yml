@@ -1,0 +1,92 @@
+---
+############################
+# PLAY: INSTALL HELM
+# Purpose: Install Helm 3 on control-plane node(s) via official apt repo,
+#          verify installation, and optionally install a sample chart.
+############################
+- name: Install Helm on manager node
+  hosts: manager
+  become: true
+  gather_facts: false
+  tags: [helm]
+
+  vars:
+    install_sample_chart: false     # set true to install a demo chart
+    sample_chart_name: demo-nginx
+    sample_chart_repo_name: bitnami
+    sample_chart_repo_url: https://charts.bitnami.com/bitnami
+    sample_chart_ref: bitnami/nginx
+
+  tasks:
+    # Simple install via official get-helm-3 script (as in guide)
+    - name: Check if helm already installed
+      ansible.builtin.command: helm version
+      register: helm_ver
+      changed_when: false
+      failed_when: false
+
+    - name: Download get-helm-3 script
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+        dest: /tmp/get-helm-3
+        mode: '0755'
+      when: helm_ver.rc != 0
+
+    - name: Install helm using get-helm-3 script
+      ansible.builtin.command: bash /tmp/get-helm-3
+      args:
+        creates: /usr/local/bin/helm
+      when: helm_ver.rc != 0
+
+    - name: Verify helm version
+      ansible.builtin.command: helm version
+      register: helm_ver_final
+      changed_when: false
+
+    - name: Show helm version
+      ansible.builtin.debug:
+        var: helm_ver_final.stdout
+
+    # Configure kubeconfig on manager from the first control-plane node
+    - name: Fetch admin.conf from control-plane
+      ansible.builtin.slurp:
+        path: /etc/kubernetes/admin.conf
+      delegate_to: "{{ groups['kube_control_plane'][0] }}"
+      register: cp_admin_conf
+      run_once: true
+
+    - name: Ensure kube dir on manager
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        mode: '0700'
+
+    - name: Install kubeconfig on manager
+      ansible.builtin.copy:
+        dest: /root/.kube/config
+        content: "{{ cp_admin_conf.content | b64decode }}"
+        mode: '0600'
+
+    # Optional: install a sample chart (Bitnami Nginx) for quick test
+    - name: Add sample chart repo (Bitnami)
+      ansible.builtin.command: >-
+        helm repo add {{ sample_chart_repo_name }} {{ sample_chart_repo_url }}
+      changed_when: false
+      when: install_sample_chart | bool
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Update helm repo index
+      ansible.builtin.command: helm repo update
+      changed_when: false
+      when: install_sample_chart | bool
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Install sample chart (Nginx)
+      ansible.builtin.command: >-
+        helm upgrade --install {{ sample_chart_name }} {{ sample_chart_ref }}
+        --namespace default
+      when: install_sample_chart | bool
+      environment:
+        KUBECONFIG: /root/.kube/config

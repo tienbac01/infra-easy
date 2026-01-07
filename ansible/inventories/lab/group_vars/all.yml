@@ -1,0 +1,27 @@
+---
+# Global defaults for this lab inventory
+
+# Proxy configuration
+proxy_url: "https://192.168.5.8:3128"
+no_proxy: "127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.svc,.cluster.local"
+
+# Squid cert installer script (served via proxy)
+install_script_url: "https://192.168.5.8:3128/install.sh"
+install_script_path: "/usr/local/sbin/proxy-cert-install.sh"
+
+# Docker APT repo
+docker_repo_url: "https://download.docker.com/linux/ubuntu"
+
+# Map Ansible arch to dpkg arch for Docker repo
+dpkg_arch_map:
+  x86_64: amd64
+  aarch64: arm64
+  armv7l: armhf
+  ppc64le: ppc64el
+  s390x: s390x
+
+# Offline images directory and patterns
+offline_image_dir: "/mnt/data"
+offline_image_patterns:
+  - "*.tar"
+  - "*.tar.gz"

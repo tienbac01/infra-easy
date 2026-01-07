@@ -1,0 +1,227 @@
+---
+############################
+# PLAY: ENABLE K8S DASHBOARD
+# Purpose: Deploy Kubernetes Dashboard, create admin user + token,
+#          and optionally expose via NodePort.
+############################
+- name: Enable Kubernetes Dashboard
+  hosts: manager
+  become: true
+  gather_facts: false
+  tags: [dashboard]
+
+  vars:
+    # Install via Helm (as in the guide)
+    dashboard_chart_repo_name: kubernetes-dashboard
+    dashboard_chart_repo_url: https://kubernetes.github.io/dashboard/
+    dashboard_release_name: kubernetes-dashboard
+    dashboard_namespace: kubernetes-dashboard
+
+    # Where to fetch kubeconfig from (control-plane leader)
+    cp_delegate: "{{ groups['kube_control_plane'][0] }}"
+
+    # NodePort exposure (optional)
+    dashboard_expose_nodeport: false
+    dashboard_nodeport: 30001   # must be within your cluster's NodePort range
+    # Optional: persistent port-forward on manager (systemd)
+    dashboard_pf_enable: true
+    dashboard_pf_address: 0.0.0.0
+    dashboard_pf_local_port: 8443
+
+  tasks:
+    # Ensure kubeconfig present on manager (copy from first control-plane)
+    - name: Fetch admin.conf from control-plane
+      ansible.builtin.slurp:
+        path: /etc/kubernetes/admin.conf
+      delegate_to: "{{ cp_delegate }}"
+      register: cp_admin_conf
+      run_once: true
+
+    - name: Ensure kube dir exists
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        mode: '0700'
+
+    - name: Install kubeconfig on manager
+      ansible.builtin.copy:
+        dest: /root/.kube/config
+        content: "{{ cp_admin_conf.content | b64decode }}"
+        mode: '0600'
+
+    # Ensure Helm present on manager (must run 6_install_helm.yml beforehand)
+    - name: Check helm availability
+      ansible.builtin.command: helm version
+      register: helm_ver
+      changed_when: false
+      failed_when: helm_ver.rc != 0
+
+    # Helm install Kubernetes Dashboard
+    - name: Add dashboard Helm repo
+      ansible.builtin.command: >-
+        helm repo add {{ dashboard_chart_repo_name }} {{ dashboard_chart_repo_url }}
+      changed_when: false
+      register: helm_repo_add
+      retries: 3
+      delay: 10
+      until: helm_repo_add.rc == 0
+      environment:
+        HTTP_PROXY: "{{ helm_http_proxy | default(omit) }}"
+        HTTPS_PROXY: "{{ helm_https_proxy | default(omit) }}"
+        NO_PROXY: "{{ helm_no_proxy | default(omit) }}"
+
+    - name: Update Helm repos
+      ansible.builtin.command: helm repo update
+      changed_when: false
+      register: helm_repo_update
+      retries: 3
+      delay: 10
+      until: helm_repo_update.rc == 0
+      environment:
+        HTTP_PROXY: "{{ helm_http_proxy | default(omit) }}"
+        HTTPS_PROXY: "{{ helm_https_proxy | default(omit) }}"
+        NO_PROXY: "{{ helm_no_proxy | default(omit) }}"
+
+    - name: Install/upgrade Kubernetes Dashboard via Helm
+      ansible.builtin.command: >-
+        helm upgrade --install {{ dashboard_release_name }}
+        {{ dashboard_chart_repo_name }}/kubernetes-dashboard
+        --namespace {{ dashboard_namespace }}
+        --create-namespace
+        {% if dashboard_expose_nodeport | bool %}
+        --set service.type=NodePort
+        --set service.nodePort={{ dashboard_nodeport }}
+        {% endif %}
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: dash_helm
+      changed_when: dash_helm.rc == 0
+
+    - name: Wait for all dashboard deployments to be Available
+      ansible.builtin.command: >-
+        kubectl -n {{ dashboard_namespace }}
+        wait --for=condition=Available deploy -l app.kubernetes.io/instance={{ dashboard_release_name }} --timeout=300s
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+
+    # Admin user + binding
+    - name: Render dashboard admin user manifest
+      ansible.builtin.copy:
+        dest: /tmp/dashboard-admin-user.yaml
+        mode: '0644'
+        content: |
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: admin-user
+            namespace: {{ dashboard_namespace }}
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: admin-user-binding
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: cluster-admin
+          subjects:
+          - kind: ServiceAccount
+            name: admin-user
+            namespace: {{ dashboard_namespace }}
+
+    - name: Apply dashboard admin user
+      ansible.builtin.command: kubectl apply --server-side -f /tmp/dashboard-admin-user.yaml
+      environment:
+        KUBECONFIG: /root/.kube/config
+      changed_when: false
+
+    - name: Generate dashboard login token
+      ansible.builtin.command: kubectl -n {{ dashboard_namespace }} create token admin-user
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: dashboard_token
+      changed_when: false
+
+    - name: Show dashboard token (copy this to login)
+      ansible.builtin.debug:
+        msg: "{{ dashboard_token.stdout | trim }}"
+
+    - name: Ensure local dashboard dir exists on controller
+      ansible.builtin.file:
+        path: /tmp/infra-easy/dashboard
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: false
+
+    - name: Save dashboard token to controller
+      ansible.builtin.copy:
+        dest: /tmp/infra-easy/dashboard/token.txt
+        content: "{{ dashboard_token.stdout | trim }}\n"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+
+    # Optional: Expose Dashboard via NodePort
+    - name: Patch dashboard Service to NodePort
+      ansible.builtin.command: >-
+        kubectl -n {{ dashboard_namespace }} patch svc kubernetes-dashboard
+        -p '{"spec":{"type":"NodePort"}}'
+      environment:
+        KUBECONFIG: /root/.kube/config
+      when: dashboard_expose_nodeport | bool
+      changed_when: false
+
+    - name: Set fixed NodePort if requested
+      ansible.builtin.command: >-
+        kubectl -n {{ dashboard_namespace }} patch svc kubernetes-dashboard
+        -p '{"spec":{"ports":[{"port":443,"protocol":"TCP","targetPort":8443,"nodePort":{{ dashboard_nodeport }} }]}}'
+      environment:
+        KUBECONFIG: /root/.kube/config
+      when: dashboard_expose_nodeport | bool and dashboard_nodeport is defined
+      changed_when: false
+
+    - name: Hint for accessing Dashboard
+      ansible.builtin.debug:
+        msg:
+          - "Option A (proxy): run 'kubectl proxy --address 0.0.0.0 --accept-hosts ^.*$' on manager"
+          - "Open: http://<manager_ip>:8001/api/v1/namespaces/kubernetes-dashboard/services/https:kubernetes-dashboard:/proxy/"
+          - "Option B (NodePort): https://<any_node_ip>:{{ dashboard_nodeport }} (if dashboard_expose_nodeport=true)"
+
+    # Optional: run kubectl port-forward as a systemd service on manager
+    - name: Deploy systemd unit for Dashboard port-forward
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/k8s-dashboard-portforward.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Kubectl port-forward for Kubernetes Dashboard
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          User=root
+          Environment=KUBECONFIG=/root/.kube/config
+          ExecStart=/usr/bin/kubectl -n kubernetes-dashboard port-forward svc/kubernetes-dashboard {{ dashboard_pf_local_port }}:443 --address {{ dashboard_pf_address }}
+          Restart=always
+          RestartSec=5s
+
+          [Install]
+          WantedBy=multi-user.target
+      when: dashboard_pf_enable | bool
+
+    - name: Reload systemd and start port-forward service
+      ansible.builtin.systemd:
+        daemon_reload: true
+        name: k8s-dashboard-portforward
+        state: started
+        enabled: true
+      when: dashboard_pf_enable | bool
+
+    - name: Verify dashboard port-forward is listening
+      ansible.builtin.command: ss -lntp | grep ":{{ dashboard_pf_local_port }} "
+      register: dash_pf_ss
+      changed_when: false
+      failed_when: false
+      when: dashboard_pf_enable | bool

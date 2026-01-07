@@ -1,0 +1,12 @@
+# target host or group
+- hosts: all
+  tasks:
+  # any task name
+  - name: Test Task
+    # use file module to set the file state
+    file:
+      path: /home/sf/test.conf
+      state: touch
+      owner: sf
+      group: sf
+      mode: 0600

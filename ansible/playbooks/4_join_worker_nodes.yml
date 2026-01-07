@@ -1,0 +1,102 @@
+---
+############################
+# PLAY: JOIN WORKER NODES
+# Purpose: Fetch or generate a kubeadm join command and run it on
+#          worker nodes to add them to the cluster (containerd CRI).
+############################
+- name: Join worker nodes to Kubernetes cluster
+  hosts: kube_node
+  become: true
+  gather_facts: false
+  tags: [workers, join]
+
+  vars:
+    # Container runtime socket (containerd by default)
+    cri_socket: unix:///run/containerd/containerd.sock
+    # Optional: path on controller where join command may have been saved
+    worker_join_script: /tmp/infra-easy/joins/worker_join.sh
+
+  pre_tasks:
+    # Idempotency guard: if kubelet.conf exists, assume node is already joined
+    - name: Check if node already joined (kubelet.conf exists)
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+  tasks:
+    # Try to read a previously saved join command from the controller
+    - name: Check for locally saved worker join script on controller
+      ansible.builtin.stat:
+        path: "{{ worker_join_script }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: join_script_stat
+
+    - name: Read worker join command from controller file (if present)
+      ansible.builtin.slurp:
+        path: "{{ worker_join_script }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: join_script_slurp
+      when: join_script_stat.stat.exists
+
+    - name: Set worker_join_command from controller file
+      ansible.builtin.set_fact:
+        worker_join_command: "{{ (join_script_slurp.content | b64decode).splitlines() | select('search','kubeadm join') | list | first | trim }}"
+      run_once: true
+      when: join_script_stat.stat.exists
+
+    # Fallback: generate a fresh join command on the first control-plane node
+    - name: Generate worker join command on control-plane (fallback)
+      ansible.builtin.command: kubeadm token create --print-join-command
+      delegate_to: "{{ groups['kube_control_plane'][0] }}"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: worker_join_gen
+      run_once: true
+      when: not join_script_stat.stat.exists
+
+    - name: Set worker_join_command from generated output
+      ansible.builtin.set_fact:
+        worker_join_command: "{{ worker_join_gen.stdout | trim }}"
+      run_once: true
+      when: not join_script_stat.stat.exists
+
+    # Run kubeadm join on workers that are not already joined
+    - name: Run kubeadm join on worker
+      ansible.builtin.command: >-
+        {{ worker_join_command }}
+        --cri-socket {{ cri_socket }}
+      register: join_result
+      when: not kubelet_conf.stat.exists
+
+    - name: Show join output (debug)
+      ansible.builtin.debug:
+        var: join_result.stdout
+      when: not kubelet_conf.stat.exists
+
+    - name: Ensure kubelet enabled and started
+      ansible.builtin.service:
+        name: kubelet
+        state: started
+        enabled: true
+
+  post_tasks:
+    - name: Derive worker InternalIP to match node (use ansible_host)
+      ansible.builtin.set_fact:
+        target_node_ip: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+
+    # Optional: verify from control-plane that node becomes Ready
+    - name: Wait for node to register and be Ready (from control-plane)
+      ansible.builtin.command: >-
+        bash -lc "kubectl get nodes -o wide --no-headers | awk '$6==\"{{ target_node_ip }}\"{print $2}'"
+      delegate_to: "{{ groups['kube_control_plane'][0] }}"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: node_check
+      changed_when: false
+      retries: 20
+      delay: 6
+      until: node_check.rc == 0 and (node_check.stdout | trim) == 'Ready'

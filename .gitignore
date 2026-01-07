@@ -21,3 +21,6 @@ crash.log
 *.bak
 *~
 .DS_Store
+
+# Venv
+*.venv/

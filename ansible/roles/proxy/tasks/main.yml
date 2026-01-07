@@ -1,0 +1,54 @@
+---
+- name: Configure APT to use proxy
+  copy:
+    dest: /etc/apt/apt.conf.d/95proxies
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      Acquire::http::Proxy "{{ proxy_url }}";
+      Acquire::https::Proxy "{{ proxy_url }}";
+  tags: [ 'proxy' ]
+
+- name: Ensure /etc/environment has proxy variables (lowercase)
+  lineinfile:
+    path: /etc/environment
+    regexp: '^{{ item.key }}='
+    line: '{{ item.key }}="{{ item.value }}"'
+    create: true
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - { key: 'http_proxy',  value: '{{ proxy_url }}' }
+    - { key: 'https_proxy', value: '{{ proxy_url }}' }
+    - { key: 'no_proxy',    value: '{{ no_proxy }}' }
+  tags: [ 'proxy' ]
+
+- name: Ensure /etc/environment has proxy variables (uppercase)
+  lineinfile:
+    path: /etc/environment
+    regexp: '^{{ item.key }}='
+    line: '{{ item.key }}="{{ item.value }}"'
+  loop:
+    - { key: 'HTTP_PROXY',  value: '{{ proxy_url }}' }
+    - { key: 'HTTPS_PROXY', value: '{{ proxy_url }}' }
+    - { key: 'NO_PROXY',    value: '{{ no_proxy }}' }
+  tags: [ 'proxy' ]
+
+- name: Download squid cert install script (ignore TLS validation)
+  get_url:
+    url: "{{ install_script_url }}"
+    dest: "{{ install_script_path }}"
+    mode: '0755'
+    validate_certs: false
+  environment:
+    http_proxy: "{{ proxy_url }}"
+    https_proxy: "{{ proxy_url }}"
+  tags: [ 'cert' ]
+
+- name: Run cert installer script (add_cert)
+  command: "{{ install_script_path }} add_cert"
+  register: cert_install
+  changed_when: false
+  tags: [ 'cert' ]

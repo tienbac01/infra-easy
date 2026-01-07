@@ -4,7 +4,7 @@ manage_etc_hosts: true
 ssh_pwauth: true
 users:
   - default
-  - name: ubuntu
+  - name: ${admin_username}
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: false
@@ -15,7 +15,7 @@ users:
 
 chpasswd:
   list: |
-    ubuntu:${ubuntu_password}
+    ${admin_username}:${admin_password}
   expire: false
 
 ${disk_block}

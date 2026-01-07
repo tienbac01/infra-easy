@@ -1,0 +1,37 @@
+---
+- name: Check Docker availability
+  command: docker version --format '{{"{{"}}.Server.Version{{"}}"}}'
+  register: docker_version
+  changed_when: false
+  tags: [ 'images' ]
+
+- name: Find offline image archives
+  find:
+    paths: "{{ offline_image_dir }}"
+    patterns: "{{ offline_image_patterns }}"
+    recurse: yes
+    file_type: file
+  register: image_files
+  tags: [ 'images' ]
+
+- name: Fail if no image archives found
+  fail:
+    msg: "No image archives found in {{ offline_image_dir }} (looked for {{ offline_image_patterns | join(', ') }})"
+  when: (image_files.matched | default(0) | int) == 0
+  tags: [ 'images' ]
+
+- name: Load Docker images from archives
+  shell: |
+    set -o pipefail
+    f="{{ item.path }}"
+    if [[ "$f" == *.gz ]]; then
+      gzip -dc "$f" | docker load
+    else
+      docker load -i "$f"
+    fi
+  args:
+    executable: /bin/bash
+  loop: "{{ image_files.files | sort(attribute='path') }}"
+  loop_control:
+    label: "{{ item.path }}"
+  tags: [ 'images' ]

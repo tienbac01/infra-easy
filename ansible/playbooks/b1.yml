@@ -1,0 +1,218 @@
+---
+# ===== Common prep + containerd + kube tools =====
+- name: Prep all nodes (control + workers)
+  hosts: kube_cluster
+  become: true
+  tasks:
+    - name: Disable swap (runtime)
+      command: swapoff -a
+      when: ansible_swaptotal_mb | int > 0
+      changed_when: false
+
+    - name: Disable swap (persist)
+      replace:
+        path: /etc/fstab
+        regexp: '(^[^#].*\s+swap\s+)'
+        replace: '# \1'
+
+    - name: Load kernel modules on boot
+      copy:
+        dest: /etc/modules-load.d/containerd.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: modprobe overlay
+      modprobe: { name: overlay, state: present }
+
+    - name: modprobe br_netfilter
+      modprobe: { name: br_netfilter, state: present }
+
+    - name: Sysctl for k8s networking
+      copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+
+    - name: Apply sysctl
+      command: sysctl --system
+
+    - name: Base packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        update_cache: true
+        state: present
+
+    - name: Install containerd
+      apt: { name: containerd, state: present, update_cache: true }
+
+    - name: Ensure /etc/containerd
+      file: { path: /etc/containerd, state: directory }
+
+    - name: Generate default containerd config
+      shell: "containerd config default > /etc/containerd/config.toml"
+      args: { creates: /etc/containerd/config.toml }
+
+    - name: Use systemd cgroup driver
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup\s*=\s*false'
+        replace: 'SystemdCgroup = true'
+
+    - name: Restart & enable containerd
+      systemd: { name: containerd, state: restarted, enabled: true }
+
+    - name: Ensure keyrings dir
+      file: { path: /etc/apt/keyrings, state: directory, mode: '0755' }
+
+    - name: Add Kubernetes APT key (pkgs.k8s.io)
+      get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key"
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes APT repo
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /
+
+    - name: apt update
+      apt: { update_cache: true }
+
+    - name: Install kubelet/kubeadm/kubectl
+      apt:
+        name: [kubelet, kubeadm, kubectl]
+        state: present
+
+    - name: Hold kube packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: [kubelet, kubeadm, kubectl]
+
+    - name: Enable kubelet
+      systemd: { name: kubelet, enabled: true }
+
+# ===== Initialize control-plane =====
+- name: Initialize control-plane
+  hosts: kube_control_plane
+  become: true
+  any_errors_fatal: true
+  vars:
+    kubeadm_config_path: /tmp/kubeadm-config.yaml
+  tasks:
+    - name: kubeadm config
+      copy:
+        dest: "{{ kubeadm_config_path }}"
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta4
+          kind: ClusterConfiguration
+          kubernetesVersion: "v{{ kubernetes_version }}.0"
+          networking:
+            podSubnet: "{{ pod_network_cidr }}"
+          ---
+          apiVersion: kubeadm.k8s.io/v1beta4
+          kind: InitConfiguration
+          nodeRegistration:
+            criSocket: "unix:///run/containerd/containerd.sock"
+
+    - name: kubeadm init
+      command: kubeadm init --config {{ kubeadm_config_path }}
+      args: { creates: /etc/kubernetes/admin.conf }
+
+    - name: Prepare kubeconfig for remote user
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0700'
+
+    - name: Copy admin.conf to user
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        remote_src: true
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'
+
+    - name: Install Calico CNI
+      become_user: "{{ ansible_user }}"
+      environment: { KUBECONFIG: "/home/{{ ansible_user }}/.kube/config" }
+      command: >
+        kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.3/manifests/calico.yaml
+
+    - name: Create join command
+      command: kubeadm token create --print-join-command
+      register: join_cmd
+      changed_when: false
+      run_once: true
+
+    - name: Set join fact for workers
+      set_fact:
+        kube_join_cmd: "{{ join_cmd.stdout }}"
+      run_once: true
+
+    # --- (optional) export kubeconfig to controller running Ansible
+    - name: Fetch admin.conf to controller
+      fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: ./admin.conf
+        flat: true
+
+# ===== Join workers =====
+- name: Join worker nodes
+  hosts: kube_node
+  become: true
+  vars:
+    kube_join_cmd: "{{ hostvars[groups['kube_control_plane'][0]].kube_join_cmd | default('') }}"
+  tasks:
+    - name: Ensure join cmd exists
+      fail: { msg: "No join command from control-plane." }
+      when: kube_join_cmd == ''
+
+    - name: kubeadm join
+      command: "{{ kube_join_cmd }} --cri-socket unix:///run/containerd/containerd.sock"
+      args: { creates: /etc/kubernetes/kubelet.conf }
+
+# ===== Setup kubectl on manager and push kubeconfig =====
+- name: Install kubectl on manager
+  hosts: manager
+  become: true
+  tasks:
+    - name: Add Kubernetes key/repo (same as nodes)
+      block:
+        - file: { path: /etc/apt/keyrings, state: directory, mode: '0755' }
+        - get_url:
+            url: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key"
+            dest: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        - copy:
+            dest: /etc/apt/sources.list.d/kubernetes.list
+            content: |
+              deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /
+        - apt: { update_cache: true }
+        - apt: { name: kubectl, state: present }
+
+    - name: Ensure ~/.kube on manager
+      file:
+        path: "/home/{{ ansible_user }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0700'
+
+    - name: Copy kubeconfig (from controller to manager)
+      copy:
+        src: "./admin.conf"
+        dest: "/home/{{ ansible_user }}/.kube/config"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0600'

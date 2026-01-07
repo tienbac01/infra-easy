@@ -1,0 +1,282 @@
+---
+############################
+# PLAY 1: PREREQS (kernel & sysctl)
+############################
+- name: K8s prereqs - kernel modules & sysctl
+  hosts: kube_cluster
+  become: true
+  gather_facts: true
+  tags: [prereqs, sysctl, net]
+
+  handlers:
+    - name: reload sysctl
+      ansible.builtin.command: sysctl --system
+      changed_when: false
+
+  pre_tasks:
+    - name: Update apt cache (once)
+      ansible.builtin.apt:
+        update_cache: true
+      changed_when: false
+
+  tasks:
+    - name: Ensure kernel modules config exists for K8s
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: '0644'
+
+    - name: Load overlay module now
+      community.general.modprobe:
+        name: overlay
+        state: present
+
+    - name: Load br_netfilter module now
+      community.general.modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: Configure sysctl for Kubernetes CRI networking
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        mode: '0644'
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+      notify: reload sysctl
+
+
+############################
+# PLAY 2: CONTAINERD
+############################
+- name: Install & configure containerd
+  hosts: kube_cluster
+  become: true
+  gather_facts: true
+  tags: [containerd, cri]
+  collections:
+    - community.general
+  vars:
+    pause_image: "registry.k8s.io/pause:3.10.1"
+
+
+  handlers:
+    - name: restart containerd
+      ansible.builtin.service:
+        name: containerd
+        state: restarted
+
+  tasks:
+    - name: Install containerd
+      ansible.builtin.apt:
+        name: containerd
+        state: present
+
+    - name: Ensure /etc/containerd exists
+      ansible.builtin.file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Generate default containerd config if missing (idempotent)
+      ansible.builtin.shell: |
+        containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+      notify: restart containerd
+        
+    # Chỉnh TOML bằng tomlkit trên controller rồi copy ngược lại
+    - name: Ensure local tmp base dir exists (local)
+      ansible.builtin.file:
+        path: "/tmp/infra-easy"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: false
+
+    - name: Ensure tomlkit installed on controller (venv)
+      ansible.builtin.pip:
+        name: tomlkit
+        virtualenv: "/tmp/infra-easy/.venv-tomlkit"
+        virtualenv_command: "python3 -m venv"
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Ensure local artifacts dir exists
+      ansible.builtin.file:
+        path: "/tmp/infra-easy/containerd/{{ inventory_hostname }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: false
+
+    - name: Fetch containerd config to controller
+      ansible.builtin.fetch:
+        src: /etc/containerd/config.toml
+        dest: "/tmp/infra-easy/containerd/{{ inventory_hostname }}/"
+        flat: true
+
+    - name: Update containerd config locally with tomlkit
+      ansible.builtin.shell: |
+        set -euo pipefail
+        "/tmp/infra-easy/.venv-tomlkit/bin/python" - << 'PY'
+        from pathlib import Path
+        from tomlkit import parse, dumps, table
+
+        p = Path(r"/tmp/infra-easy/containerd/{{ inventory_hostname }}/config.toml")
+        text = p.read_text(encoding='utf-8')
+        doc = parse(text)
+
+        def ensure_tbl(parent, key):
+          if key not in parent or parent[key] is None:
+            parent[key] = table()
+          return parent[key]
+
+        plugins = ensure_tbl(doc, 'plugins')
+        cri = plugins.get('io.containerd.grpc.v1.cri')
+        if cri is None:
+          cri = table()
+          plugins['io.containerd.grpc.v1.cri'] = cri
+
+        # sandbox_image
+        cri['sandbox_image'] = "{{ pause_image }}"
+
+        # containerd runtime defaults & SystemdCgroup under ...runc.options
+        containerd = ensure_tbl(cri, 'containerd')
+        # Ensure default runtime name exists (maps empty RuntimeClass to runc)
+        if not containerd.get('default_runtime_name'):
+            containerd['default_runtime_name'] = 'runc'
+        runtimes = ensure_tbl(containerd, 'runtimes')
+        runc = ensure_tbl(runtimes, 'runc')
+        # Ensure runtime_type is set to runc v2
+        if not runc.get('runtime_type'):
+            runc['runtime_type'] = 'io.containerd.runc.v2'
+        options = ensure_tbl(runc, 'options')
+        options['SystemdCgroup'] = True
+
+        p.write_text(dumps(doc), encoding='utf-8')
+        PY
+      args:
+        executable: /bin/bash
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Copy updated config back to remote
+      ansible.builtin.copy:
+        src: "/tmp/infra-easy/containerd/{{ inventory_hostname }}/config.toml"
+        dest: /etc/containerd/config.toml
+        mode: '0644'
+        backup: true
+      notify: restart containerd
+
+    - name: Ensure containerd service enabled and started
+      ansible.builtin.service:
+        name: containerd
+        state: started
+        enabled: true
+
+
+############################
+# PLAY 3: KUBERNETES APT REPO
+############################
+- name: Add Kubernetes apt repository (pkgs.k8s.io)
+  hosts: kube_cluster
+  become: true
+  gather_facts: false
+  tags: [repo, kubernetes]
+
+  vars:
+    k8s_minor: "v1.34"   # chỉnh theo nhánh bạn muốn
+    k8s_repo: "https://pkgs.k8s.io/core:/stable:/{{ k8s_minor }}/deb/"
+    k8s_keyring: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+  tasks:
+    - name: Ensure keyrings dir exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Kubernetes repo Release.key
+      ansible.builtin.get_url:
+        url: "{{ k8s_repo }}Release.key"
+        dest: /tmp/kubernetes-release.key
+        mode: '0644'
+
+    - name: Convert Release.key to keyring (gpg --dearmor)
+      ansible.builtin.command:
+        cmd: "gpg --dearmor -o {{ k8s_keyring }} /tmp/kubernetes-release.key"
+      args:
+        creates: "{{ k8s_keyring }}"
+
+    - name: Add Kubernetes apt repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by={{ k8s_keyring }}] {{ k8s_repo }} /"
+        filename: "kubernetes"
+        state: present
+
+    - name: Update apt cache after adding repo
+      ansible.builtin.apt:
+        update_cache: true
+
+
+############################
+# PLAY 4: KUBE PACKAGES
+############################
+- name: Install kubeadm, kubelet, kubectl + hold
+  hosts: kube_cluster
+  become: true
+  gather_facts: false
+  tags: [kube, packages]
+
+  tasks:
+    - name: Install kubeadm, kubelet, kubectl
+      ansible.builtin.apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Hold kube* packages to avoid undesired upgrades
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+
+############################
+# PLAY 5: VERIFY
+############################
+- name: Verify kube components
+  hosts: kube_cluster
+  become: true
+  gather_facts: false
+  tags: [verify]
+
+  tasks:
+    - name: Show kubeadm version
+      ansible.builtin.command: kubeadm version -o short
+      register: kubeadm_ver
+      changed_when: false
+      failed_when: false
+
+    - name: Show kubelet status
+      ansible.builtin.command: systemctl is-active kubelet
+      register: kubelet_status
+      changed_when: false
+      failed_when: false
+
+    - name: Debug versions/status
+      ansible.builtin.debug:
+        msg:
+          - "kubeadm={{ kubeadm_ver.stdout | default('unknown') }}"
+          - "kubelet_status={{ kubelet_status.stdout | default('n/a') }}"

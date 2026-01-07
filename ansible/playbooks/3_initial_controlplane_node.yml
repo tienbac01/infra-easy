@@ -1,0 +1,250 @@
+---
+############################
+# PLAY: INITIAL CONTROL PLANE
+# Purpose: Initialize the first control-plane with kubeadm,
+#          set up kubeconfig for convenience, optionally apply CNI,
+#          and produce join commands for workers/extra CP nodes.
+############################
+- name: Initialize first control-plane node
+  hosts: kube_control_plane
+  become: true
+  gather_facts: true
+  tags: [controlplane, kubeadm_init]
+
+  vars:
+    # Networking for pods (adjust to your chosen CNI)
+    pod_network_cidr: "192.168.0.0/16"   # Calico single-manifest default; change if needed
+    # API Server advertise address (defaults to the main IPv4 of the host)
+    apiserver_advertise_address: "{{ ansible_default_ipv4.address }}"
+    # Optional stable endpoint (IP/DNS or VIP) for multi-CP setups
+    # Example: control_plane_endpoint: "10.0.0.25:6443" or "k8s-vip.example.com:6443"
+    # If not set, flag is omitted.
+    # control_plane_endpoint: ""
+    # Optional additional subjectAltNames for API server cert
+    # Example: apiserver_cert_extra_sans: ["10.0.0.25", "k8s-vip.example.com"]
+    # apiserver_cert_extra_sans: []
+    # Container runtime socket (containerd by default)
+    cri_socket: unix:///run/containerd/containerd.sock
+    # CNI selection: set to 'calico' to install Calico via Tigera operator
+    # If you prefer a raw manifest URL, set cni_manifest_url instead.
+    cni_provider: calico
+    calico_version: v3.28.0
+
+  pre_tasks:
+    # Pull required images up-front to surface network/image issues early
+    - name: Pre-pull Kubernetes images (optional but recommended)
+      ansible.builtin.command: >-
+        kubeadm config images pull
+        --cri-socket {{ cri_socket }}
+      changed_when: false
+
+    # Idempotency guard: if admin.conf exists, the node is already initialized
+    - name: Check if cluster already initialized
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: admin_conf
+
+  tasks:
+    # Initialize the control-plane components on this node
+    - name: kubeadm init (idempotent via presence of admin.conf)
+      ansible.builtin.command: >-
+        kubeadm init
+        {% if control_plane_endpoint is defined and control_plane_endpoint|length > 0 %}
+        --control-plane-endpoint={{ control_plane_endpoint }}
+        {% endif %}
+        --pod-network-cidr={{ pod_network_cidr }}
+        --apiserver-advertise-address={{ apiserver_advertise_address }}
+        {% if apiserver_cert_extra_sans is defined and (apiserver_cert_extra_sans|length) > 0 %}
+        --apiserver-cert-extra-sans={{ apiserver_cert_extra_sans | join(',') }}
+        {% endif %}
+        --cri-socket {{ cri_socket }}
+      args:
+        creates: /etc/kubernetes/admin.conf
+      register: kubeadm_init
+      when: not admin_conf.stat.exists
+
+    # Prepare kubeconfig for root user
+    - name: Ensure kubeconfig for root
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Copy admin.conf to root kubeconfig
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: true
+        owner: root
+        group: root
+        mode: '0600'
+
+    # Also prepare kubeconfig for the original login user (if not root)
+    - name: Determine non-root login user (if any)
+      ansible.builtin.set_fact:
+        kube_login_user: "{{ ansible_env.SUDO_USER | default(ansible_user_id) }}"
+
+    - name: Check home dir for non-root user
+      ansible.builtin.stat:
+        path: "/home/{{ kube_login_user }}"
+      register: kube_user_home
+      when: kube_login_user != 'root'
+
+    - name: Ensure kubeconfig for non-root user
+      ansible.builtin.file:
+        path: "/home/{{ kube_login_user }}/.kube"
+        state: directory
+        owner: "{{ kube_login_user }}"
+        group: "{{ kube_login_user }}"
+        mode: '0700'
+      when: kube_login_user != 'root' and kube_user_home.stat.exists
+
+    - name: Copy admin.conf to non-root kubeconfig
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ kube_login_user }}/.kube/config"
+        remote_src: true
+        owner: "{{ kube_login_user }}"
+        group: "{{ kube_login_user }}"
+        mode: '0600'
+      when: kube_login_user != 'root' and kube_user_home.stat.exists
+
+    # Export KUBECONFIG globally for convenience (optional)
+    - name: Create kubectl env for all shells
+      ansible.builtin.copy:
+        dest: /etc/profile.d/kubeconfig.sh
+        content: |
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+        mode: '0644'
+
+    # Wait until API server responds to kubectl requests
+    - name: Wait for api-server to be reachable
+      ansible.builtin.command: kubectl version --request-timeout=15s --client=false
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: kubectl_ver
+      changed_when: false
+      retries: 10
+      delay: 6
+      until: kubectl_ver.rc == 0
+
+    # Optional: apply your CNI manifest if URL is provided (takes precedence)
+    - name: Optionally apply generic CNI manifest (cni_manifest_url)
+      ansible.builtin.command: kubectl apply -f {{ cni_manifest_url }}
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: cni_manifest_url is defined
+
+    # Calico installation (single manifest, no operator)
+    - name: Ensure local calico dir on controller
+      ansible.builtin.file:
+        path: "/tmp/infra-easy/calico"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: cni_manifest_url is not defined and cni_provider | default('') | lower == 'calico'
+
+    - name: Download Calico single-manifest to controller
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/calico.yaml"
+        dest: "/tmp/infra-easy/calico/calico-{{ calico_version }}.yaml"
+        mode: '0644'
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: cni_manifest_url is not defined and cni_provider | default('') | lower == 'calico'
+
+    # Note: Calico single-manifest defaults to 192.168.0.0/16 IP pool.
+    # The play uses the same default pod_network_cidr to avoid editing the manifest.
+
+    - name: Transfer Calico manifest to control-plane node
+      ansible.builtin.copy:
+        src: "/tmp/infra-easy/calico/calico-{{ calico_version }}.yaml"
+        dest: "/tmp/calico-{{ calico_version }}.yaml"
+        mode: '0644'
+      when: cni_manifest_url is not defined and cni_provider | default('') | lower == 'calico'
+
+    - name: Apply Calico manifest (server-side)
+      ansible.builtin.command: >-
+        kubectl apply --server-side -f /tmp/calico-{{ calico_version }}.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: cni_manifest_url is not defined and cni_provider | default('') | lower == 'calico'
+
+    - name: Wait for calico-node DaemonSet to be available
+      ansible.builtin.command: kubectl -n kube-system rollout status ds/calico-node --timeout=300s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_node_rollout
+      changed_when: false
+      when: cni_manifest_url is not defined and cni_provider | default('') | lower == 'calico'
+
+    - name: Wait for calico-kube-controllers Deployment to be available
+      ansible.builtin.command: kubectl -n kube-system rollout status deploy/calico-kube-controllers --timeout=300s
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_ctrl_rollout
+      changed_when: false
+      when: cni_manifest_url is not defined and cni_provider | default('') | lower == 'calico'
+
+    # Produce join command for worker nodes
+    - name: Generate worker join command
+      ansible.builtin.command: kubeadm token create --print-join-command
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: worker_join
+      changed_when: false
+
+    # Upload certs to allow additional control-plane nodes to join
+    - name: Upload certs to enable control-plane join and get key
+      ansible.builtin.command: kubeadm init phase upload-certs --upload-certs
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: upload_certs
+      changed_when: false
+
+    # Extract the 64-hex certificate key from upload-certs output
+    - name: Parse certificate key from upload-certs output
+      ansible.builtin.set_fact:
+        cp_cert_key: "{{ (upload_certs.stdout | regex_search('([0-9a-fA-F]{64})')) | default('') }}"
+
+    # Build the final control-plane join command (only if key exists)
+    - name: Compute control-plane join command
+      ansible.builtin.set_fact:
+        control_plane_join: "{{ worker_join.stdout }} --control-plane --certificate-key {{ cp_cert_key }}"
+      when: cp_cert_key | length > 0
+
+    - name: Warn if certificate key not found (skipping CP join command)
+      ansible.builtin.debug:
+        msg: "Could not parse certificate key from 'kubeadm init phase upload-certs'. Control-plane join command will not be generated."
+      when: cp_cert_key | length == 0
+
+    # Save both join commands to the controller's local filesystem
+    - name: Ensure local dir for join commands
+      ansible.builtin.file:
+        path: "/tmp/infra-easy/joins"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: false
+
+    - name: Save worker join command locally
+      ansible.builtin.copy:
+        dest: "/tmp/infra-easy/joins/worker_join.sh"
+        content: "#!/usr/bin/env bash\n{{ worker_join.stdout | trim }}\n"
+        mode: '0755'
+      delegate_to: localhost
+      become: false
+
+    - name: Save control-plane join command locally
+      ansible.builtin.copy:
+        dest: "/tmp/infra-easy/joins/control_plane_join.sh"
+        content: "#!/usr/bin/env bash\n{{ control_plane_join | trim }}\n"
+        mode: '0755'
+      delegate_to: localhost
+      become: false
+      when: control_plane_join is defined

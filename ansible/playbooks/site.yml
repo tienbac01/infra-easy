@@ -1,0 +1,9 @@
+---
+- name: Site playbook
+  hosts: all
+  become: true
+  gather_facts: true
+  roles:
+    - proxy
+    - docker
+    - images

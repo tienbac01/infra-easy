@@ -17,5 +17,5 @@ mounts:
 
 runcmd:
   - [ mkdir, -p, ${data_mountpoint} ]
-  - [ chown, -R, ubuntu:ubuntu, ${data_mountpoint} ]
+  - [ chown, -R, ${admin_username}:${admin_username}, ${data_mountpoint} ]
   - [ mount, -a ]
